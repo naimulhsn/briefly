@@ -29,13 +29,27 @@ ingestRouter.get("/status", async (req, res) => {
 ingestRouter.post("/run", async (req, res) => {
   const auth = authorized(req);
   if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
-  try {
-    const result = await runIngest({
-      log: (...a) => console.log("[ingest]", ...a),
+  // Run in the background so a 30–100s proxy timeout cannot kill the briefing.
+  runIngest({
+    log: (...a) => console.log("[ingest]", ...a),
+  })
+    .then((result) => {
+      if (result?.ok) {
+        console.log(
+          "[ingest] finished",
+          `feeds ${result.feedsOk}/${result.feedsOk + result.feedsFailed}`,
+          `stories +${result.clustersCreated}`
+        );
+      } else {
+        console.log("[ingest] ended", result?.error || result);
+      }
+    })
+    .catch((err) => {
+      console.error("[ingest] failed", err.message || err);
     });
-    res.json(result);
-  } catch (err) {
-    console.error("[ingest] failed", err);
-    res.status(500).json({ error: "Ingest failed", detail: String(err.message || err).slice(0, 400) });
-  }
+  res.status(202).json({
+    ok: true,
+    accepted: true,
+    message: "Ingest started. Poll GET /api/ingest/status until running is null.",
+  });
 });

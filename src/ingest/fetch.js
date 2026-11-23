@@ -238,7 +238,7 @@ export async function fetchAllFeeds(onProgress) {
 
 export async function recentArticles(hours = 72) {
   const since = new Date(Date.now() - hours * 3600 * 1000).toISOString();
-  return await db
+  const rows = await db
     .prepare(
       `SELECT a.*, s.name AS source_name, s.type AS source_type, s.location_level AS source_level, s.via
        FROM articles a JOIN sources s ON s.id = a.source_id
@@ -246,4 +246,18 @@ export async function recentArticles(hours = 72) {
        ORDER BY a.published_at DESC`
     )
     .all(since, since);
+  const cap = Number(process.env.INGEST_ARTICLE_CAP || 500);
+  if (!cap || rows.length <= cap) return rows;
+  const priority = [];
+  const rest = [];
+  for (const a of rows) {
+    if (a.source_type === "local" || a.source_type === "factcheck") priority.push(a);
+    else rest.push(a);
+  }
+  const kept = [...priority];
+  for (const a of rest) {
+    if (kept.length >= cap) break;
+    kept.push(a);
+  }
+  return kept;
 }

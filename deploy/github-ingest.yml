@@ -1,6 +1,6 @@
 # Twice-daily briefing at 6:00 and 18:00 Asia/Dhaka (00:00 and 12:00 UTC).
 # Render's free web service sleeps after 15 idle minutes, so this job
-# first wakes the app, then triggers ingest, retrying through a cold start.
+# first wakes the app, then starts ingest (202) and polls until it finishes.
 name: Twice-daily briefing
 on:
   schedule:
@@ -22,71 +22,87 @@ jobs:
             exit 1
           fi
           base="${APP_URL%/}"
-          echo "Target host: $(python3 -c 'import os,urllib.parse; print(urllib.parse.urlparse(os.environ["APP_URL"]).netloc)')"
+          python3 -c 'import os,urllib.parse; print("Target host:", urllib.parse.urlparse(os.environ["APP_URL"]).netloc)'
 
           wake() {
-            curl -sS -o /tmp/health.json -w "%{http_code}" \
-              --max-time 90 \
-              --retry 0 \
-              "$base/api/health" || true
+            curl -sS -o /tmp/health.json -w "%{http_code}" --max-time 90 "$base/api/health" || true
           }
-
-          ingest() {
+          start_ingest() {
             curl -sS -o /tmp/ingest.json -w "%{http_code}" \
               -X POST "$base/api/ingest/run" \
               -H "X-Ingest-Secret: $INGEST_SECRET" \
               -H "Content-Type: application/json" \
-              --max-time 240 || true
+              --max-time 90 || true
+          }
+          status() {
+            curl -sS -o /tmp/status.json -w "%{http_code}" --max-time 60 "$base/api/ingest/status" || true
           }
 
+          up=0
           for i in 1 2 3 4 5 6 7 8; do
-            echo "Attempt $i: waking the service…"
+            echo "Wake attempt $i…"
             code=$(wake)
             echo "  health HTTP $code"
-            if [ "$code" != "200" ]; then
-              sleep $((10 * i))
+            if [ "$code" = "200" ]; then
+              up=1
+              break
+            fi
+            sleep $((10 * i))
+          done
+          if [ "$up" != "1" ]; then
+            echo "Service did not become healthy"
+            exit 1
+          fi
+
+          started=0
+          for i in 1 2 3 4 5; do
+            echo "Start ingest attempt $i…"
+            icode=$(start_ingest)
+            echo "  ingest HTTP $icode"
+            if [ "$icode" = "202" ] || [ "$icode" = "200" ] || [ "$icode" = "409" ]; then
+              started=1
+              break
+            fi
+            sleep $((10 * i))
+          done
+          if [ "$started" != "1" ]; then
+            echo "Could not start ingest"
+            exit 1
+          fi
+
+          echo "Polling ingest status…"
+          for i in $(seq 1 24); do
+            scode=$(status)
+            if [ "$scode" != "200" ]; then
+              echo "  poll $i: status HTTP $scode"
+              sleep 10
               continue
             fi
-            echo "  service is up, starting ingest…"
-            icode=$(ingest)
-            echo "  ingest HTTP $icode"
-            if [ "$icode" = "200" ]; then
-              python3 - << 'PY'
-          import json
-          try:
-              d = json.load(open("/tmp/ingest.json"))
-          except Exception as e:
-              print("could not parse ingest body:", e)
-              raise SystemExit(1)
-          print("ingest ok:", {
-              "feedsOk": d.get("feedsOk"),
-              "feedsFailed": d.get("feedsFailed"),
-              "articlesFetched": d.get("articlesFetched"),
-              "articlesNew": d.get("articlesNew"),
-              "clustersCreated": d.get("clustersCreated"),
-              "aiProcessed": d.get("aiProcessed"),
-              "processor": d.get("processor"),
-          })
-          PY
-              exit 0
-            fi
-            # 409 = already running, treat as success after a short wait
-            if [ "$icode" = "409" ]; then
-              echo "  ingest already running; treating as success"
-              exit 0
-            fi
-            sleep $((15 * i))
-          done
-          echo "All attempts failed (cold start or ingest error)"
-          if [ -f /tmp/ingest.json ]; then
             python3 - << 'PY'
-          import json
-          try:
-              d = json.load(open("/tmp/ingest.json"))
-              # Print only non-secret error fields
-              print({k: d[k] for k in d if k in ("error", "detail", "ok", "status")})
-          except Exception:
-              print("no usable ingest body")
+          import json, sys
+          d = json.load(open("/tmp/status.json"))
+          running = d.get("running")
+          lat = d.get("latest") or {}
+          print("  poll: running=", running, "latest.status=", lat.get("status"), "stories=", lat.get("clusters_created"), "feeds=", lat.get("feeds_ok"))
+          if running:
+              sys.exit(2)
+          if lat.get("status") == "ok":
+              sys.exit(0)
+          if lat.get("status") == "error":
+              sys.exit(3)
+          # No run recorded yet
+          sys.exit(2)
           PY
-          fi
+            st=$?
+            if [ "$st" = "0" ]; then
+              echo "Ingest finished successfully"
+              exit 0
+            fi
+            if [ "$st" = "3" ]; then
+              echo "Ingest recorded an error"
+              exit 1
+            fi
+            sleep 15
+          done
+          echo "Timed out waiting for ingest to finish"
           exit 1

@@ -101,17 +101,18 @@ export async function runIngest({ hours = 72, homeArea = "Pagar, Tongi, Gazipur"
   if (running) {
     return { ok: false, error: "An ingest is already running", id: running.id };
   }
-  await upsertSources();
-  const started = nowIso();
-  const info = await db
+  running = { id: null, started_at: new Date().toISOString(), status: "starting" };
+  let runId = null;
+  try {
+    await upsertSources();
+    const started = running.started_at;
+    const info = await db
     .prepare(
       "INSERT INTO ingestion_runs (started_at, status, processor) VALUES (?, ?, ?)"
     )
     .run(started, "running", availableProcessor());
-  const runId = info.lastInsertRowid;
-  running = { id: runId, started_at: started, status: "running" };
-
-  try {
+    runId = info.lastInsertRowid;
+    running = { id: runId, started_at: started, status: "running" };
     log("Fetching feeds…");
     const fetched = await fetchAllFeeds((p) => {
       if (p.ok) log(`  ✓ ${p.source} (${p.count})`);
@@ -260,9 +261,11 @@ export async function runIngest({ hours = 72, homeArea = "Pagar, Tongi, Gazipur"
     log("Ingest complete.", `${created} new stories, ${updated} updated, AI=${aiCount} (${processor})`);
     return summary;
   } catch (err) {
-    await db.prepare(
-      "UPDATE ingestion_runs SET finished_at=?, status=?, error=? WHERE id=?"
-    ).run(nowIso(), "error", String(err.stack || err).slice(0, 2000), runId);
+    if (runId) {
+      await db.prepare(
+        "UPDATE ingestion_runs SET finished_at=?, status=?, error=? WHERE id=?"
+      ).run(nowIso(), "error", String(err.stack || err).slice(0, 2000), runId);
+    }
     running = null;
     throw err;
   }
