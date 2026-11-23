@@ -240,22 +240,28 @@ export async function recentArticles(hours = 72, { cap = Number(process.env.INGE
   const since = new Date(Date.now() - hours * 3600 * 1000).toISOString();
   const rows = await db
     .prepare(
-      `SELECT a.*, s.name AS source_name, s.type AS source_type, s.location_level AS source_level, s.via
+      `SELECT a.*, s.name AS source_name, s.type AS source_type, s.location_level AS source_level, s.via,
+              CASE WHEN EXISTS (SELECT 1 FROM story_articles sa WHERE sa.article_id = a.id) THEN 1 ELSE 0 END AS linked
        FROM articles a JOIN sources s ON s.id = a.source_id
        WHERE a.published_at >= ? OR a.fetched_at >= ?
-       ORDER BY a.published_at DESC`
+       ORDER BY linked ASC, a.published_at DESC`
     )
     .all(since, since);
   if (!cap || rows.length <= cap) return rows;
+  const unlinked = [];
   const priority = [];
   const rest = [];
   for (const a of rows) {
-    if (a.source_type === "local" || a.source_type === "factcheck") priority.push(a);
+    if (!a.linked) unlinked.push(a);
+    else if (a.source_type === "local" || a.source_type === "factcheck") priority.push(a);
     else rest.push(a);
   }
-  const kept = [...priority];
-  for (const a of rest) {
-    if (kept.length >= cap) break;
+  // Unlinked rows (e.g. after a failed save) always come first so they get
+  // clustered on the next run. Fill the remainder of the cap with local /
+  // fact-check then other recent articles.
+  const kept = [...unlinked];
+  for (const a of [...priority, ...rest]) {
+    if (kept.length >= Math.max(cap, unlinked.length)) break;
     kept.push(a);
   }
   return kept;

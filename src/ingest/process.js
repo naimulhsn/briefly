@@ -184,8 +184,11 @@ export async function runIngest({ hours = 72, homeArea = "Pagar, Tongi, Gazipur"
 
     let created = 0;
     let updated = 0;
-    const saveTx = db.transaction(async () => {
-      for (const [i, cluster] of clusters.entries()) {
+    // Write stories statement-by-statement. A single Turso interactive
+    // transaction over hundreds of round trips is rolled back when the
+    // stream sits idle (SQLITE_BUSY: interactive transaction was rolled
+    // back because the stream was idle for too long).
+    for (const [i, cluster] of clusters.entries()) {
         const ai = results[i];
         const blob = cluster.articles.map((a) => `${a.title}\n${a.description || ""}`).join("\n");
         const loc =
@@ -245,8 +248,6 @@ export async function runIngest({ hours = 72, homeArea = "Pagar, Tongi, Gazipur"
           await insertParty.run(storyId, p.name, p.role);
         }
       }
-    });
-    await saveTx();
 
     const finished = nowIso();
     await db.prepare(

@@ -32,6 +32,7 @@ export async function geminiGenerate(prompt, model) {
       "Content-Type": "application/json",
       "x-goog-api-key": config.geminiKey,
     },
+    signal: AbortSignal.timeout(25000),
     body: JSON.stringify({
       contents: [{ role: "user", parts: [{ text: prompt }] }],
       generationConfig: {
@@ -54,6 +55,7 @@ export async function openaiCompatibleGenerate({ url, apiKey, model, prompt, hea
       Authorization: `Bearer ${apiKey}`,
       ...headers,
     },
+    signal: AbortSignal.timeout(25000),
     body: JSON.stringify({
       model,
       temperature: 0.3,
