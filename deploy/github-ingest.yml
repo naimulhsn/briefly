@@ -78,27 +78,27 @@ jobs:
               sleep 10
               continue
             fi
-            python3 - << 'PY'
+            python3 - << 'PY' > /tmp/poll-state.txt
           import json, sys
           d = json.load(open("/tmp/status.json"))
           running = d.get("running")
           lat = d.get("latest") or {}
-          print("  poll: running=", running, "latest.status=", lat.get("status"), "stories=", lat.get("clusters_created"), "feeds=", lat.get("feeds_ok"))
+          print("  poll: running=", running, "latest.status=", lat.get("status"), "stories=", lat.get("clusters_created"), "feeds=", lat.get("feeds_ok"), file=sys.stderr)
           if running:
-              sys.exit(2)
-          if lat.get("status") == "ok":
-              sys.exit(0)
-          if lat.get("status") == "error":
-              sys.exit(3)
-          # No run recorded yet
-          sys.exit(2)
+              print("running")
+          elif lat.get("status") == "ok":
+              print("ok")
+          elif lat.get("status") == "error":
+              print("error")
+          else:
+              print("running")
           PY
-            st=$?
-            if [ "$st" = "0" ]; then
+            st=$(cat /tmp/poll-state.txt)
+            if [ "$st" = "ok" ]; then
               echo "Ingest finished successfully"
               exit 0
             fi
-            if [ "$st" = "3" ]; then
+            if [ "$st" = "error" ]; then
               echo "Ingest recorded an error"
               exit 1
             fi
