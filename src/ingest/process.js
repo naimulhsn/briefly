@@ -35,6 +35,10 @@ const updateStory = db.prepare(`
 const linkArticle = db.prepare(
   "INSERT OR IGNORE INTO story_articles (story_id, article_id) VALUES (?, ?)"
 );
+const unlinkArticle = db.prepare("DELETE FROM story_articles WHERE article_id = ?");
+const attachArticle = db.prepare(
+  "INSERT INTO story_articles (story_id, article_id) VALUES (?, ?)"
+);
 const clearParties = db.prepare("DELETE FROM story_parties WHERE story_id = ?");
 const insertParty = db.prepare(
   "INSERT OR IGNORE INTO story_parties (story_id, party_name, role) VALUES (?, ?, ?)"
@@ -317,34 +321,45 @@ export async function reclusterArchive({
     const embeddings = await ensureEmbeddings("articles", articles, { log });
     const clusters = await clusterArticles(articles, { hours, embeddings, log });
     log(`  ${clusters.length} event clusters`);
+    const clusterOf = new Map();
+    clusters.forEach((c, i) => {
+      for (const a of c.articles) clusterOf.set(Number(a.id), i);
+    });
+    const links = await db.prepare("SELECT story_id, article_id FROM story_articles").all();
+    const priorArticles = new Map();
+    const overlap = new Map();
+    for (const row of links) {
+      const sid = row.story_id;
+      const aid = Number(row.article_id);
+      if (!priorArticles.has(sid)) priorArticles.set(sid, []);
+      priorArticles.get(sid).push(aid);
+      const ci = clusterOf.get(aid);
+      if (ci == null) continue;
+      if (!overlap.has(sid)) overlap.set(sid, new Map());
+      const m = overlap.get(sid);
+      m.set(ci, (m.get(ci) || 0) + 1);
+    }
+    const reuse = new Array(clusters.length).fill(null);
+    const ranked = [...overlap.entries()].map(([sid, m]) => {
+      let best = null;
+      let bestN = -1;
+      for (const [ci, n] of m) if (n > bestN) { best = ci; bestN = n; }
+      return { sid, best, bestN, total: (priorArticles.get(sid) || []).length };
+    }).sort((a, b) => b.bestN - a.bestN || b.total - a.total);
+    for (const row of ranked) {
+      if (row.best == null) continue;
+      if (reuse[row.best] == null) reuse[row.best] = row.sid;
+    }
+
     let merged = 0;
     let touched = 0;
     let created = 0;
     const examples = [];
-    for (const cluster of clusters) {
-      const existing = await storiesForArticles(cluster.articles.map((a) => a.id));
-      if (existing.length) {
-        const canon = pickCanonicalStory(existing);
-        if (existing.length > 1) {
-          const dropped = existing.filter((s) => s.id !== canon.id);
-          await mergeStoryIds(canon.id, dropped.map((s) => s.id), { embedding: cluster.embedding });
-          merged += dropped.length;
-          examples.push({
-            kept: canon.title,
-            dropped: dropped.map((s) => s.title),
-            articles: cluster.articles.length,
-          });
-        }
-        for (const a of cluster.articles) await linkArticle.run(canon.id, a.id);
-        const countRow = await db
-          .prepare("SELECT COUNT(*) AS n FROM story_articles WHERE story_id = ?")
-          .get(canon.id);
-        await db
-          .prepare("UPDATE stories SET article_count = ?, updated_at = ? WHERE id = ?")
-          .run(countRow?.n || cluster.articles.length, nowIso(), canon.id);
-        if (cluster.embedding) await saveEmbedding("stories", canon.id, cluster.embedding);
-        touched += 1;
-      } else {
+    const assigned = new Array(clusters.length).fill(null);
+    for (let i = 0; i < clusters.length; i++) {
+      const cluster = clusters[i];
+      let storyId = reuse[i];
+      if (storyId == null) {
         const loc = classifyLocation(
           cluster.articles.map((a) => `${a.title}\n${a.description || ""}`).join("\n"),
           cluster.articles[0]?.source_level
@@ -372,12 +387,45 @@ export async function reclusterArchive({
           cluster_key: clusterKey(cluster),
           article_count: cluster.articles.length,
         });
-        const storyId = res.lastInsertRowid;
-        for (const a of cluster.articles) await linkArticle.run(storyId, a.id);
-        if (cluster.embedding) await saveEmbedding("stories", storyId, cluster.embedding);
+        storyId = res.lastInsertRowid;
         created += 1;
+      } else {
+        touched += 1;
+      }
+      assigned[i] = storyId;
+      for (const a of cluster.articles) {
+        await unlinkArticle.run(a.id);
+        await attachArticle.run(storyId, a.id);
+      }
+      await db
+        .prepare("UPDATE stories SET article_count = ?, updated_at = ? WHERE id = ?")
+        .run(cluster.articles.length, nowIso(), storyId);
+      if (cluster.embedding) await saveEmbedding("stories", storyId, cluster.embedding);
+    }
+
+    // Move bookmarks off stories that were emptied by a split or merge.
+    for (const [oldId, aids] of priorArticles) {
+      const destCounts = new Map();
+      for (const aid of aids) {
+        const ci = clusterOf.get(Number(aid));
+        if (ci == null) continue;
+        const dest = assigned[ci];
+        if (dest) destCounts.set(dest, (destCounts.get(dest) || 0) + 1);
+      }
+      let dest = null;
+      let destN = -1;
+      for (const [id, n] of destCounts) if (n > destN) { dest = id; destN = n; }
+      if (dest && dest !== oldId) {
+        await db.prepare(
+          "INSERT OR IGNORE INTO bookmarks (user_id, story_id, created_at) SELECT user_id, ?, created_at FROM bookmarks WHERE story_id = ?"
+        ).run(dest, oldId);
+        if (!assigned.includes(oldId)) merged += 1;
       }
     }
+    const emptied = await db.prepare(
+      "DELETE FROM stories WHERE id NOT IN (SELECT DISTINCT story_id FROM story_articles)"
+    ).run();
+    if (emptied?.changes) log(`  removed ${emptied.changes} empty stories after splits`);
     await db.prepare(
       "DELETE FROM story_parties WHERE story_id NOT IN (SELECT id FROM stories)"
     ).run();
@@ -398,7 +446,7 @@ export async function reclusterArchive({
     };
     running = null;
     log(
-      `Recluster complete. stories ${summary.before} → ${summary.after} (merged ${merged} duplicates, created ${created})`
+      `Recluster complete. stories ${summary.before} → ${summary.after} (merged ${merged}, created ${created})`
     );
     return summary;
   } catch (err) {
