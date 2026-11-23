@@ -152,7 +152,7 @@ export async function runIngest({ hours = 72, homeArea = "Pagar, Tongi, Gazipur"
     log("Clustering recent articles…");
     const articles = await recentArticles(hours);
     const embeddings = await ensureEmbeddings("articles", articles, { log });
-    let clusters = await clusterArticles(articles, { hours, embeddings });
+    let clusters = await clusterArticles(articles, { hours, embeddings, log });
     clusters = attachFactChecks(clusters);
     for (const c of clusters) {
       const blob = c.articles.map((a) => `${a.title}\n${a.description || ""}`).join("\n");
@@ -314,7 +314,7 @@ export async function reclusterArchive({
     const articles = await recentArticles(lookbackHours, { cap: 0 });
     log(`  ${articles.length} articles in lookback window`);
     const embeddings = await ensureEmbeddings("articles", articles, { log });
-    const clusters = await clusterArticles(articles, { hours, embeddings });
+    const clusters = await clusterArticles(articles, { hours, embeddings, log });
     log(`  ${clusters.length} event clusters`);
     let merged = 0;
     let touched = 0;

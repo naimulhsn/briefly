@@ -255,8 +255,62 @@ function shouldLink(A, B, cos, heur) {
   return false;
 }
 
-function yieldOften(counter) {
-  if (counter % 4000 !== 0) return Promise.resolve();
+function featuresOf(article) {
+  const title = article.title || "";
+  const norm = normalizeTitle(title);
+  return {
+    tok: new Set(tokens(title)),
+    grams: charNgrams(title),
+    ent: entities(title),
+    places: placesOf(title),
+    conflictFlags: CONFLICT_GROUPS.map((group) => group.some((g) => norm.includes(g))),
+    eventFlags: EVENT_CONFLICTS.map(([g1, g2]) => [
+      g1.some((g) => norm.includes(g)),
+      g2.some((g) => norm.includes(g)),
+    ]),
+  };
+}
+
+function similarityFeat(fa, fb) {
+  const jac = jaccard(fa.tok, fb.tok);
+  const gram = jaccard(fa.grams, fb.grams);
+  const ent = jaccard(fa.ent, fb.ent);
+  let score = jac * 0.5 + gram * 0.3 + ent * 0.2;
+  const bridges = [...fa.tok].filter((tok) => ALL_BRIDGES.has(tok) && fb.tok.has(tok));
+  const strong = bridges.filter((tok) => STRONG_BRIDGES.has(tok));
+  if (strong.length >= 1 && bridges.length >= 3) score = Math.max(score, 0.5);
+  if (strong.length >= 2) score = Math.max(score, 0.52);
+  return score;
+}
+
+function conflictsFeat(fa, fb) {
+  for (let i = 0; i < fa.conflictFlags.length; i++) {
+    if (fa.conflictFlags[i] !== fb.conflictFlags[i]) return true;
+  }
+  const pa = fa.places;
+  const pb = fb.places;
+  if (pa.length && pb.length) {
+    let compatible = false;
+    for (const x of pa) {
+      for (const y of pb) {
+        if (x === y || (PLACE_FAMILY[x] || x) === (PLACE_FAMILY[y] || y)) {
+          compatible = true;
+          break;
+        }
+      }
+      if (compatible) break;
+    }
+    if (!compatible) return true;
+  }
+  for (let i = 0; i < fa.eventFlags.length; i++) {
+    const [a1, a2] = fa.eventFlags[i];
+    const [b1, b2] = fb.eventFlags[i];
+    if ((a1 && b2) || (a2 && b1)) return true;
+  }
+  return false;
+}
+
+function yieldOften() {
   return new Promise((r) => setImmediate(r));
 }
 
@@ -277,25 +331,41 @@ export async function clusterArticles(articles, opts = {}) {
   const vecOf = (article) =>
     embeddings.get(article.id) || article.embedding || null;
 
+  // Precompute title features and vectors once. Re-running normalizeTitle /
+  // n-grams / conflict checks inside the pairwise loop is what made a live
+  // recluster stall for many minutes on Render's free 512MB instance.
+  const feats = articles.map((a) => featuresOf(a));
+  const vecs = articles.map((a) => vecOf(a));
+  const windowMs = hours * 3600 * 1000;
+  const log = typeof opts.log === "function" ? opts.log : null;
+
   let compared = 0;
+  const t0 = Date.now();
   for (let x = 0; x < n; x++) {
     const i = order[x].i;
+    const tx = order[x].t;
+    const fa = feats[i];
+    const va = vecs[i];
     for (let y = x + 1; y < n; y++) {
-      if (order[y].t - order[x].t > hours * 3600 * 1000 && order[x].t && order[y].t) break;
+      const ty = order[y].t;
+      if (tx && ty && ty - tx > windowMs) break;
       const j = order[y].i;
-      const A = articles[i];
-      const B = articles[j];
-      if (!closeInTime(A, B, hours)) continue;
-      if (conflicts(A, B)) continue;
-      const va = vecOf(A);
-      const vb = vecOf(B);
+      if (tx && ty && Math.abs(ty - tx) > windowMs) continue;
+      if (conflictsFeat(fa, feats[j])) continue;
+      const vb = vecs[j];
       const cos = va && vb ? cosineSim(va, vb) : 0;
-      const heur = similarity(A, B);
-      if (shouldLink(A, B, cos, heur)) uf.union(i, j);
+      const heur = cos >= EMBED_THRESHOLD ? 0 : similarityFeat(fa, feats[j]);
+      if (shouldLink(null, null, cos, heur)) uf.union(i, j);
       compared += 1;
-      if (compared % 4000 === 0) await yieldOften(compared);
+      if (compared % 800 === 0) {
+        await yieldOften();
+        if (log && compared % 40000 === 0) {
+          log(`  compared ${compared} pairs in ${Date.now() - t0}ms`);
+        }
+      }
     }
   }
+  if (log) log(`  compared ${compared} pairs in ${Date.now() - t0}ms`);
 
   // Optional second pass (off by default). A full centroid comparison over
   // ~1300 clusters is too expensive for a 512MB instance and caused live
