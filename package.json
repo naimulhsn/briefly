@@ -8,7 +8,8 @@
     "start": "node server.js",
     "ingest": "node scripts/ingest-once.js",
     "dev": "node --watch server.js",
-    "migrate:turso": "node scripts/migrate-to-turso.js"
+    "migrate:turso": "node scripts/migrate-to-turso.js",
+    "recluster": "node scripts/recluster-archive.js"
   },
   "engines": {
     "node": ">=20"

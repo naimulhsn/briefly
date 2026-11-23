@@ -1,8 +1,11 @@
 import { db, nowIso, parseJson } from "../db.js";
 import { fetchAllFeeds, recentArticles, upsertSources } from "./fetch.js";
-import { clusterArticles, factCheckLikelyMatch, similarity } from "./cluster.js";
+import { clusterArticles, factCheckLikelyMatch, similarity, EMBED_THRESHOLD } from "./cluster.js";
 import { classifyLocation, geoScoreFor } from "./geo.js";
 import { analyzeClusters, availableProcessor } from "../ai/index.js";
+import { cosineSimilarity } from "../ai/embeddings.js";
+import { ensureEmbeddings, saveEmbedding, parseStoredEmbedding } from "./vectors.js";
+import { mergeStoryIds, pickCanonicalStory, storiesForArticles } from "./merge-stories.js";
 
 let running = null;
 
@@ -85,10 +88,32 @@ function attachFactChecks(clusters) {
   return [...news, ...leftover];
 }
 
-async function resolveExistingStory(cluster) {
-  for (const a of cluster.articles) {
-    const row = await existingStoryForArticle.get(a.id);
-    if (row) return row.story_id;
+async function resolveExistingStory(cluster, { hours = 72 } = {}) {
+  const existing = await storiesForArticles(cluster.articles.map((a) => a.id));
+  if (existing.length) {
+    const canon = pickCanonicalStory(existing);
+    if (existing.length > 1) {
+      await mergeStoryIds(canon.id, existing.map((s) => s.id), { embedding: cluster.embedding });
+    }
+    return canon.id;
+  }
+  if (cluster.embedding) {
+    const since = new Date(Date.now() - hours * 3600 * 1000).toISOString();
+    const stories = await db
+      .prepare("SELECT id, title, processor, article_count, summary, embed_json, published_at FROM stories WHERE published_at >= ? OR updated_at >= ?")
+      .all(since, since);
+    let best = null;
+    let bestCos = 0;
+    for (const s of stories) {
+      const vec = parseStoredEmbedding(s);
+      if (!vec) continue;
+      const cos = cosineSimilarity(cluster.embedding, vec);
+      if (cos > bestCos) {
+        bestCos = cos;
+        best = s;
+      }
+    }
+    if (best && bestCos >= EMBED_THRESHOLD) return best.id;
   }
   return null;
 }
@@ -126,7 +151,8 @@ export async function runIngest({ hours = 72, homeArea = "Pagar, Tongi, Gazipur"
 
     log("Clustering recent articles…");
     const articles = await recentArticles(hours);
-    let clusters = clusterArticles(articles);
+    const embeddings = await ensureEmbeddings("articles", articles, { log });
+    let clusters = await clusterArticles(articles, { hours, embeddings });
     clusters = attachFactChecks(clusters);
     for (const c of clusters) {
       const blob = c.articles.map((a) => `${a.title}\n${a.description || ""}`).join("\n");
@@ -201,7 +227,7 @@ export async function runIngest({ hours = 72, homeArea = "Pagar, Tongi, Gazipur"
           article_count: cluster.articles.length,
         };
 
-        const existingId = await resolveExistingStory(cluster);
+        const existingId = await resolveExistingStory(cluster, { hours });
         let storyId;
         if (existingId) {
           await updateStory.run({ ...row, id: existingId });
@@ -213,6 +239,7 @@ export async function runIngest({ hours = 72, homeArea = "Pagar, Tongi, Gazipur"
           created += 1;
         }
         for (const a of cluster.articles) await linkArticle.run(storyId, a.id);
+        if (cluster.embedding) await saveEmbedding("stories", storyId, cluster.embedding);
         await clearParties.run(storyId);
         for (const p of ai.parties || []) {
           await insertParty.run(storyId, p.name, p.role);
@@ -266,6 +293,114 @@ export async function runIngest({ hours = 72, homeArea = "Pagar, Tongi, Gazipur"
         "UPDATE ingestion_runs SET finished_at=?, status=?, error=? WHERE id=?"
       ).run(nowIso(), "error", String(err.stack || err).slice(0, 2000), runId);
     }
+    running = null;
+    throw err;
+  }
+}
+
+
+export async function reclusterArchive({
+  hours = 72,
+  lookbackHours = 720,
+  log = console.log,
+} = {}) {
+  if (running) {
+    return { ok: false, error: "An ingest is already running", id: running.id };
+  }
+  running = { id: null, started_at: new Date().toISOString(), status: "reclustering" };
+  try {
+    const before = await db.prepare("SELECT COUNT(*) AS n FROM stories").get();
+    log(`Reclustering archive (${before?.n || 0} stories)…`);
+    const articles = await recentArticles(lookbackHours, { cap: 0 });
+    log(`  ${articles.length} articles in lookback window`);
+    const embeddings = await ensureEmbeddings("articles", articles, { log });
+    const clusters = await clusterArticles(articles, { hours, embeddings });
+    log(`  ${clusters.length} event clusters`);
+    let merged = 0;
+    let touched = 0;
+    let created = 0;
+    const examples = [];
+    for (const cluster of clusters) {
+      const existing = await storiesForArticles(cluster.articles.map((a) => a.id));
+      if (existing.length) {
+        const canon = pickCanonicalStory(existing);
+        if (existing.length > 1) {
+          const dropped = existing.filter((s) => s.id !== canon.id);
+          await mergeStoryIds(canon.id, dropped.map((s) => s.id), { embedding: cluster.embedding });
+          merged += dropped.length;
+          examples.push({
+            kept: canon.title,
+            dropped: dropped.map((s) => s.title),
+            articles: cluster.articles.length,
+          });
+        }
+        for (const a of cluster.articles) await linkArticle.run(canon.id, a.id);
+        const countRow = await db
+          .prepare("SELECT COUNT(*) AS n FROM story_articles WHERE story_id = ?")
+          .get(canon.id);
+        await db
+          .prepare("UPDATE stories SET article_count = ?, updated_at = ? WHERE id = ?")
+          .run(countRow?.n || cluster.articles.length, nowIso(), canon.id);
+        if (cluster.embedding) await saveEmbedding("stories", canon.id, cluster.embedding);
+        touched += 1;
+      } else {
+        const loc = classifyLocation(
+          cluster.articles.map((a) => `${a.title}\n${a.description || ""}`).join("\n"),
+          cluster.articles[0]?.source_level
+        );
+        const published =
+          cluster.articles.map((a) => a.published_at).filter(Boolean).sort().at(-1) || nowIso();
+        const res = await insertStory.run({
+          title: cluster.title.slice(0, 240),
+          summary: "",
+          key_facts: "[]",
+          source_differences: "",
+          location_level: loc.level,
+          location_name: loc.name,
+          category: "other",
+          legal_label: "other",
+          legal_note: null,
+          law_suggestion: null,
+          fact_checked: 0,
+          fact_check_url: null,
+          fact_check_source: null,
+          published_at: published,
+          updated_at: nowIso(),
+          geo_score: geoScoreFor(loc.level),
+          processor: "recluster",
+          cluster_key: clusterKey(cluster),
+          article_count: cluster.articles.length,
+        });
+        const storyId = res.lastInsertRowid;
+        for (const a of cluster.articles) await linkArticle.run(storyId, a.id);
+        if (cluster.embedding) await saveEmbedding("stories", storyId, cluster.embedding);
+        created += 1;
+      }
+    }
+    await db.prepare(
+      "DELETE FROM story_parties WHERE story_id NOT IN (SELECT id FROM stories)"
+    ).run();
+    await db.prepare(
+      "DELETE FROM bookmarks WHERE story_id NOT IN (SELECT id FROM stories)"
+    ).run();
+    const after = await db.prepare("SELECT COUNT(*) AS n FROM stories").get();
+    const summary = {
+      ok: true,
+      before: before?.n || 0,
+      after: after?.n || 0,
+      merged,
+      touched,
+      created,
+      clusters: clusters.length,
+      articles: articles.length,
+      examples: examples.slice(0, 15),
+    };
+    running = null;
+    log(
+      `Recluster complete. stories ${summary.before} → ${summary.after} (merged ${merged} duplicates, created ${created})`
+    );
+    return summary;
+  } catch (err) {
     running = null;
     throw err;
   }

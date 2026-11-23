@@ -1,13 +1,9 @@
 import { config } from "../config.js";
 import { heuristicProcess } from "../ingest/labels.js";
 import { classifyLocation } from "../ingest/geo.js";
+import { availableProcessor, generateWithFallback, configuredProviders } from "./providers.js";
 
-const GEMINI_MODELS = [
-  config.geminiModel,
-  "gemini-flash-lite-latest",
-  "gemini-2.5-flash-lite",
-  "gemini-3.5-flash-lite",
-].filter((v, i, a) => v && a.indexOf(v) === i);
+export { availableProcessor, configuredProviders };
 
 const SYSTEM = `You are a careful news editor for a Bangladesh briefing app.
 Write ONLY in clear, neutral English (even when source text is Bangla).
@@ -71,70 +67,8 @@ function extractJson(text) {
   return JSON.parse(s);
 }
 
-async function geminiGenerate(prompt, model) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": config.geminiKey,
-    },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.3,
-        maxOutputTokens: 4096,
-        responseMimeType: "application/json",
-      },
-    }),
-  });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    const err = new Error(`Gemini ${res.status} (${model})`);
-    err.status = res.status;
-    err.body = body.slice(0, 300);
-    throw err;
-  }
-  const data = await res.json();
-  const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") || "";
-  return text;
-}
-
-async function groqGenerate(prompt) {
-  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${config.groqKey}`,
-    },
-    body: JSON.stringify({
-      model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
-      temperature: 0.3,
-      messages: [
-        { role: "system", content: "Return valid JSON only." },
-        { role: "user", content: prompt },
-      ],
-    }),
-  });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    const err = new Error(`Groq ${res.status}`);
-    err.status = res.status;
-    err.body = body.slice(0, 300);
-    throw err;
-  }
-  const data = await res.json();
-  return data?.choices?.[0]?.message?.content || "";
-}
-
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
-}
-
-export function availableProcessor() {
-  if (config.geminiKey) return "gemini";
-  if (config.groqKey) return "groq";
-  return "heuristic";
 }
 
 function mockFromCluster(cluster, homeArea) {
@@ -177,43 +111,8 @@ export function heuristicAnalyze(cluster, homeArea) {
 
 async function analyzeBatchWithModel(clusters, homeArea, prefer) {
   const prompt = clusterPrompt(clusters);
-  let lastErr;
-  if (prefer === "gemini" || (!prefer && config.geminiKey)) {
-    for (const model of GEMINI_MODELS) {
-      try {
-        const text = await geminiGenerate(prompt, model);
-        return { data: extractJson(text), processor: `gemini:${model}` };
-      } catch (err) {
-        lastErr = err;
-        if (err.status === 404 || err.status === 400) continue;
-        if (err.status === 429) {
-          await sleep(20000);
-          try {
-            const text = await geminiGenerate(prompt, model);
-            return { data: extractJson(text), processor: `gemini:${model}` };
-          } catch (err2) {
-            lastErr = err2;
-          }
-        }
-      }
-    }
-    if (config.groqKey) {
-      try {
-        const text = await groqGenerate(prompt);
-        return { data: extractJson(text), processor: "groq" };
-      } catch (err) {
-        lastErr = err;
-      }
-    }
-  } else if (config.groqKey) {
-    try {
-      const text = await groqGenerate(prompt);
-      return { data: extractJson(text), processor: "groq" };
-    } catch (err) {
-      lastErr = err;
-    }
-  }
-  throw lastErr || new Error("no AI provider succeeded");
+  const { text, processor } = await generateWithFallback(prompt);
+  return { data: extractJson(text), processor };
 }
 
 export async function analyzeClusters(clusters, { homeArea, onBatch } = {}) {

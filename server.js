@@ -12,7 +12,8 @@ import { statsRouter } from "./src/routes/stats.js";
 import { ingestRouter } from "./src/routes/ingest.js";
 import { startScheduler } from "./src/ingest/scheduler.js";
 import { upsertSources } from "./src/ingest/fetch.js";
-import { availableProcessor } from "./src/ai/index.js";
+import { availableProcessor, configuredProviders } from "./src/ai/index.js";
+import { availableEmbedder } from "./src/ai/embeddings.js";
 
 await initDb();
 await upsertSources();
@@ -57,6 +58,8 @@ app.get("/api/health", (req, res) => {
     name: "Briefly",
     timezone: config.timezone,
     processor: availableProcessor(),
+    providers: configuredProviders(),
+    embedder: availableEmbedder(),
     database: usingTurso ? "turso" : "local-sqlite",
     time: new Date().toISOString(),
   });

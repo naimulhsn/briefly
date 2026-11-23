@@ -53,3 +53,15 @@ Cloudflare Workers is also free and has cron + D1, but the free CPU budget (10 m
 - `GET|PUT /api/prefs`  `GET|POST|DELETE /api/bookmarks/:id`
 - `GET /api/stats`  `GET /api/stats/meta`
 - `POST /api/ingest/run`  `GET /api/ingest/status`  `GET /api/health`
+
+## Clustering and summarization
+
+Stories about the same event are clustered with multilingual Gemini embeddings (`gemini-embedding-001`, Bangla + English) and title/entity heuristics as backup. A 72-hour window and place/event conflict rules stop unrelated incidents from merging.
+
+Summarization uses Gemini Flash-Lite first, then any configured free fallback: Groq, OpenRouter, Cerebras, Mistral, or Cloudflare Workers AI. Missing keys are skipped.
+
+To rebuild clusters after a large crawl:
+
+```bash
+npm run recluster
+```

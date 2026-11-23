@@ -240,6 +240,32 @@ CREATE INDEX IF NOT EXISTS idx_sessions_expire ON sessions(expire);
 `;
 
 let initialized = false;
+export let vectorSupport = false;
+
+async function tableColumns(table) {
+  const rs = await client.execute(`PRAGMA table_info(${table})`);
+  return new Set(rs.rows.map((r) => r.name));
+}
+
+async function addColumn(table, def) {
+  const name = def.split(/\s+/)[0];
+  const cols = await tableColumns(table);
+  if (cols.has(name)) return;
+  await client.execute(`ALTER TABLE ${table} ADD COLUMN ${def}`);
+}
+
+async function detectVectorSupport() {
+  try {
+    const rs = await client.execute(
+      "SELECT vector_distance_cos(vector32('[1,0]'), vector32('[1,0]')) AS d"
+    );
+    const d = Number(rs.rows[0]?.d);
+    vectorSupport = Number.isFinite(d) && d < 0.01;
+  } catch {
+    vectorSupport = false;
+  }
+  return vectorSupport;
+}
 
 export async function initDb() {
   if (initialized) return;
@@ -253,6 +279,17 @@ export async function initDb() {
     }
   }
   await db.exec(SCHEMA);
+  await detectVectorSupport();
+  // Vectors: native F32_BLOB when libSQL/Turso supports it, plus a JSON
+  // fallback that works even if vector functions are unavailable.
+  await addColumn("articles", "embed_model TEXT");
+  await addColumn("articles", "embed_json TEXT");
+  await addColumn("stories", "embed_model TEXT");
+  await addColumn("stories", "embed_json TEXT");
+  if (vectorSupport) {
+    try { await addColumn("articles", "embedding F32_BLOB(768)"); } catch { /* already or unsupported */ }
+    try { await addColumn("stories", "embedding F32_BLOB(768)"); } catch { /* already or unsupported */ }
+  }
   initialized = true;
 }
 

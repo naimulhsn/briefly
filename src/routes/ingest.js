@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { config } from "../config.js";
-import { runIngest, getRunning, latestRun } from "../ingest/process.js";
+import { runIngest, reclusterArchive, getRunning, latestRun } from "../ingest/process.js";
 
 export const ingestRouter = Router();
 
@@ -51,5 +51,28 @@ ingestRouter.post("/run", async (req, res) => {
     ok: true,
     accepted: true,
     message: "Ingest started. Poll GET /api/ingest/status until running is null.",
+  });
+});
+
+ingestRouter.post("/recluster", async (req, res) => {
+  const auth = authorized(req);
+  if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+  reclusterArchive({
+    log: (...a) => console.log("[recluster]", ...a),
+  })
+    .then((result) => {
+      if (result?.ok) {
+        console.log("[recluster] finished", `${result.before} → ${result.after} stories`);
+      } else {
+        console.log("[recluster] ended", result?.error || result);
+      }
+    })
+    .catch((err) => {
+      console.error("[recluster] failed", err.message || err);
+    });
+  res.status(202).json({
+    ok: true,
+    accepted: true,
+    message: "Recluster started. Poll GET /api/ingest/status until running is null.",
   });
 });

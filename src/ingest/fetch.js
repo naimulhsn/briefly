@@ -236,7 +236,7 @@ export async function fetchAllFeeds(onProgress) {
   return { feedsOk, feedsFailed, articlesFetched, articlesNew, report };
 }
 
-export async function recentArticles(hours = 72) {
+export async function recentArticles(hours = 72, { cap = Number(process.env.INGEST_ARTICLE_CAP || 500) } = {}) {
   const since = new Date(Date.now() - hours * 3600 * 1000).toISOString();
   const rows = await db
     .prepare(
@@ -246,7 +246,6 @@ export async function recentArticles(hours = 72) {
        ORDER BY a.published_at DESC`
     )
     .all(since, since);
-  const cap = Number(process.env.INGEST_ARTICLE_CAP || 500);
   if (!cap || rows.length <= cap) return rows;
   const priority = [];
   const rest = [];

@@ -33,5 +33,12 @@ export const config = {
   cookieSecure: bool("COOKIE_SECURE", false),
   tursoUrl: process.env.TURSO_DATABASE_URL || "",
   tursoToken: process.env.TURSO_AUTH_TOKEN || "",
+  openrouterKey: process.env.OPENROUTER_API_KEY || "",
+  cerebrasKey: process.env.CEREBRAS_API_KEY || "",
+  mistralKey: process.env.MISTRAL_API_KEY || "",
+  cloudflareAccountId: process.env.CLOUDFLARE_ACCOUNT_ID || "",
+  cloudflareToken: process.env.CLOUDFLARE_API_TOKEN || "",
+  jinaKey: process.env.JINA_API_KEY || "",
+  cohereKey: process.env.COHERE_API_KEY || "",
 };
 
