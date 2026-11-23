@@ -34,6 +34,11 @@ const ALIASES = [
   ["gauk", ["gauking", "gda", "gazipur development authority"]],
   ["rickshaw", ["e-rickshaw", "erickshaw", "ই-রিক্সা", "রিক্সা"]],
   ["cylinder", ["সিলিন্ডার", "gas cylinder"]],
+  ["gas", ["গ্যাস"]],
+  ["leak", ["লিকেজ"]],
+  ["burn", ["দগ্ধ", "পোড়া", "burns", "burnt", "burned"]],
+  ["explosion", ["বিস্ফোরণ"]],
+  ["child", ["শিশু", "শিশুসহ"]],
 ];
 
 function applyAliases(s) {
@@ -104,8 +109,14 @@ export function entities(title) {
 }
 
 const STRONG_BRIDGES = new Set([
-  "gazipur", "tongi", "pagar", "joydebpur", "kashimpur", "konabari",
-  "awami", "bnp", "jamaat", "ncp",
+  "tongi", "pagar", "joydebpur", "kashimpur", "konabari",
+]);
+// Generic city/party tokens used to over-merge unrelated Gazipur political
+// stories when embeddings were missing. Only distinctive place or event
+// terms may boost a weak Jaccard score.
+const DISTINCTIVE_BRIDGES = new Set([
+  "tongi", "pagar", "joydebpur", "kashimpur", "konabari",
+  "cylinder", "rickshaw", "gauk", "leak",
 ]);
 const ALL_BRIDGES = new Set(ALIASES.map(([canon]) => canon));
 
@@ -120,10 +131,7 @@ export function similarity(a, b) {
   // Weighted: tokens matter most, char-grams help Bangla/English near-duplicates,
   // entities help cross-language (shared numbers, place and party names).
   let score = jac * 0.5 + gram * 0.3 + ent * 0.2;
-  const bridges = [...ta].filter((tok) => ALL_BRIDGES.has(tok) && tb.has(tok));
-  const strong = bridges.filter((tok) => STRONG_BRIDGES.has(tok));
-  if (strong.length >= 1 && bridges.length >= 3) score = Math.max(score, 0.5);
-  if (strong.length >= 2) score = Math.max(score, 0.52);
+  score = Math.max(score, bridgeBoost(ta, tb, placesOf(a.title), placesOf(b.title)));
   return score;
 }
 
@@ -133,6 +141,7 @@ const CONFLICT_GROUPS = [
 ];
 
 const PLACE_GROUPS = [
+  { id: "gazipur", keys: ["gazipur", "গাজীপুর", "গাজিপুর"] },
   { id: "tongi", keys: ["tongi", "টঙ্গী", "টাঙ্গী"] },
   { id: "pagar", keys: ["pagar", "পাগার"] },
   { id: "joydebpur", keys: ["joydebpur", "জয়দেবপুর", "জয়দেবপুর"] },
@@ -154,9 +163,31 @@ const PLACE_GROUPS = [
   { id: "benapole", keys: ["benapole", "বেনাপোল"] },
 ];
 const PLACE_FAMILY = {
+  gazipur: "gazipur",
   tongi: "gazipur", pagar: "gazipur", joydebpur: "gazipur",
   konabari: "gazipur", kashimpur: "gazipur",
 };
+
+function placeCompatible(pa, pb) {
+  if (!pa?.length || !pb?.length) return false;
+  for (const x of pa) {
+    for (const y of pb) {
+      if (x === y || (PLACE_FAMILY[x] || x) === (PLACE_FAMILY[y] || y)) return true;
+    }
+  }
+  return false;
+}
+
+function bridgeBoost(ta, tb, pa, pb) {
+  const bridges = [...ta].filter((tok) => ALL_BRIDGES.has(tok) && tb.has(tok));
+  const strong = bridges.filter((tok) => STRONG_BRIDGES.has(tok));
+  const distinctive = bridges.filter((tok) => DISTINCTIVE_BRIDGES.has(tok));
+  let boost = 0;
+  if (distinctive.length >= 2 && strong.length >= 1) boost = Math.max(boost, 0.5);
+  if (distinctive.length >= 1 && strong.length >= 1 && bridges.length >= 3) boost = Math.max(boost, 0.48);
+  if (distinctive.includes("cylinder") && placeCompatible(pa, pb)) boost = Math.max(boost, 0.5);
+  return boost;
+}
 
 function placesOf(title) {
   const t = normalizeTitle(title);
@@ -276,10 +307,7 @@ function similarityFeat(fa, fb) {
   const gram = jaccard(fa.grams, fb.grams);
   const ent = jaccard(fa.ent, fb.ent);
   let score = jac * 0.5 + gram * 0.3 + ent * 0.2;
-  const bridges = [...fa.tok].filter((tok) => ALL_BRIDGES.has(tok) && fb.tok.has(tok));
-  const strong = bridges.filter((tok) => STRONG_BRIDGES.has(tok));
-  if (strong.length >= 1 && bridges.length >= 3) score = Math.max(score, 0.5);
-  if (strong.length >= 2) score = Math.max(score, 0.52);
+  score = Math.max(score, bridgeBoost(fa.tok, fb.tok, fa.places, fb.places));
   return score;
 }
 
