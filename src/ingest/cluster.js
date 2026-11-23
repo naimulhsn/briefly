@@ -297,10 +297,19 @@ export async function clusterArticles(articles, opts = {}) {
     }
   }
 
-  // Second pass: merge clusters whose embedding centroids are very close.
-  // Recovers same-event pairs that sat just under the pairwise bar (e.g. two
-  // English paraphrases of one Gazipur appointment) without chaining every
-  // Gazipur story together (unrelated centroids stay lower).
+  // Optional second pass (off by default). A full centroid comparison over
+  // ~1300 clusters is too expensive for a 512MB instance and caused live
+  // reclusters to stall. Pairwise cosine + heuristics are sufficient.
+  if (CENTROID_THRESHOLD >= 0.98) {
+    const outFast = new Map();
+    for (let i = 0; i < n; i++) {
+      const root = uf.find(i);
+      if (!outFast.has(root)) outFast.set(root, []);
+      outFast.get(root).push(articles[i]);
+    }
+    return [...outFast.values()].map((members) => packageCluster(members, vecOf));
+  }
+
   const groups = new Map();
   for (let i = 0; i < n; i++) {
     const root = uf.find(i);
@@ -363,18 +372,20 @@ export async function clusterArticles(articles, opts = {}) {
     if (!out.has(root)) out.set(root, []);
     out.get(root).push(articles[i]);
   }
-  return [...out.values()].map((members) => {
-    const sorted = members.sort(
-      (a, b) => Date.parse(b.published_at || 0) - Date.parse(a.published_at || 0)
-    );
-    const vecs = sorted.map((a) => vecOf(a)).filter(Boolean);
-    return {
-      articles: sorted,
-      title: pickTitle(sorted),
-      published_at: sorted[0].published_at,
-      embedding: vecs.length ? mean(vecs) : null,
-    };
-  });
+  return [...out.values()].map((members) => packageCluster(members, vecOf));
+}
+
+function packageCluster(members, vecOf) {
+  const sorted = members.sort(
+    (a, b) => Date.parse(b.published_at || 0) - Date.parse(a.published_at || 0)
+  );
+  const vecs = sorted.map((a) => vecOf(a)).filter(Boolean);
+  return {
+    articles: sorted,
+    title: pickTitle(sorted),
+    published_at: sorted[0].published_at,
+    embedding: vecs.length ? mean(vecs) : null,
+  };
 }
 
 function cosineSim(a, b) {
