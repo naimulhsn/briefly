@@ -1,0 +1,92 @@
+# Twice-daily briefing at 6:00 and 18:00 Asia/Dhaka (00:00 and 12:00 UTC).
+# Render's free web service sleeps after 15 idle minutes, so this job
+# first wakes the app, then triggers ingest, retrying through a cold start.
+name: Twice-daily briefing
+on:
+  schedule:
+    - cron: "0 0,12 * * *"
+  workflow_dispatch:
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Wake the service and run ingest
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
+          INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APP_URL:-}" ] || [ -z "${INGEST_SECRET:-}" ]; then
+            echo "APP_URL or INGEST_SECRET is not set"
+            exit 1
+          fi
+          base="${APP_URL%/}"
+          echo "Target host: $(python3 -c 'import os,urllib.parse; print(urllib.parse.urlparse(os.environ["APP_URL"]).netloc)')"
+
+          wake() {
+            curl -sS -o /tmp/health.json -w "%{http_code}" \
+              --max-time 90 \
+              --retry 0 \
+              "$base/api/health" || true
+          }
+
+          ingest() {
+            curl -sS -o /tmp/ingest.json -w "%{http_code}" \
+              -X POST "$base/api/ingest/run" \
+              -H "X-Ingest-Secret: $INGEST_SECRET" \
+              -H "Content-Type: application/json" \
+              --max-time 240 || true
+          }
+
+          for i in 1 2 3 4 5 6 7 8; do
+            echo "Attempt $i: waking the service…"
+            code=$(wake)
+            echo "  health HTTP $code"
+            if [ "$code" != "200" ]; then
+              sleep $((10 * i))
+              continue
+            fi
+            echo "  service is up, starting ingest…"
+            icode=$(ingest)
+            echo "  ingest HTTP $icode"
+            if [ "$icode" = "200" ]; then
+              python3 - << 'PY'
+          import json
+          try:
+              d = json.load(open("/tmp/ingest.json"))
+          except Exception as e:
+              print("could not parse ingest body:", e)
+              raise SystemExit(1)
+          print("ingest ok:", {
+              "feedsOk": d.get("feedsOk"),
+              "feedsFailed": d.get("feedsFailed"),
+              "articlesFetched": d.get("articlesFetched"),
+              "articlesNew": d.get("articlesNew"),
+              "clustersCreated": d.get("clustersCreated"),
+              "aiProcessed": d.get("aiProcessed"),
+              "processor": d.get("processor"),
+          })
+          PY
+              exit 0
+            fi
+            # 409 = already running, treat as success after a short wait
+            if [ "$icode" = "409" ]; then
+              echo "  ingest already running; treating as success"
+              exit 0
+            fi
+            sleep $((15 * i))
+          done
+          echo "All attempts failed (cold start or ingest error)"
+          if [ -f /tmp/ingest.json ]; then
+            python3 - << 'PY'
+          import json
+          try:
+              d = json.load(open("/tmp/ingest.json"))
+              # Print only non-secret error fields
+              print({k: d[k] for k in d if k in ("error", "detail", "ok", "status")})
+          except Exception:
+              print("no usable ingest body")
+          PY
+          fi
+          exit 1

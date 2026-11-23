@@ -1,0 +1,23 @@
+# Render Blueprint. One free signup at https://render.com — no card required
+# for a free web service. See README.md for env vars and limitations.
+services:
+  - type: web
+    name: briefly-bd
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: INGEST_SECRET
+        generateValue: true
+      - key: GROQ_API_KEY
+        sync: false
+      - key: DATABASE_PATH
+        value: /data/briefly.db
